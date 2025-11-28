@@ -8,16 +8,18 @@ const basicAuth = require('basic-auth');
 const cors = require('cors');
 
 const app = express();
-app.use(cors());
+
+// --- Middleware ---
+app.use(cors()); // enable CORS (adjust in production if needed)
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Directories + files
+// --- Paths ---
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 const LEADS_FILE = path.join(__dirname, 'leads.json');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// Multer storage (disk)
+// --- Multer storage and limits ---
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
@@ -26,12 +28,13 @@ const storage = multer.diskStorage({
     cb(null, `${ts}_${safe}`);
   }
 });
+
 const upload = multer({
   storage,
-  limits: { fileSize: 10 * 1024 * 1024 } // 10 MB per file
+  limits: { fileSize: 10 * 1024 * 1024, files: 5 } // 10MB per file, up to 5 files
 });
 
-// Simple JSON leads read/save
+// --- Simple leads persistence ---
 function readLeads() {
   try {
     if (!fs.existsSync(LEADS_FILE)) return [];
@@ -43,17 +46,21 @@ function readLeads() {
   }
 }
 function saveLead(lead) {
-  const arr = readLeads();
-  arr.unshift(lead);
-  fs.writeFileSync(LEADS_FILE, JSON.stringify(arr, null, 2));
+  try {
+    const arr = readLeads();
+    arr.unshift(lead);
+    fs.writeFileSync(LEADS_FILE, JSON.stringify(arr, null, 2));
+  } catch (e) {
+    console.error('saveLead error', e);
+  }
 }
 
-// Helper escape
+// --- Helpers ---
 function escapeHtml(str = '') {
   return ('' + str).replace(/[&<>"']/g, s => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[s]));
 }
 
-// Require basic auth for admin routes
+// Basic auth for admin endpoints
 function requireAuth(req, res, next) {
   const user = basicAuth(req);
   const adminUser = process.env.ADMIN_USER || 'admin';
@@ -65,13 +72,15 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// Public: health check
+// --- Public endpoints ---
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// POST /api/submit - receives form + optional files
-app.post('/api/submit', upload.array('statements', 5), (req, res) => {
+// Accept form submissions with optional files (any field name)
+// NOTE: frontend should POST multipart/form-data (FormData).
+app.post('/api/submit', upload.any(), (req, res) => {
   try {
     const body = req.body || {};
+    // map files to relative paths for admin links
     const files = (req.files || []).map(f => ({
       path: path.join('uploads', path.basename(f.path)).replace(/\\/g, '/'),
       originalname: f.originalname,
@@ -83,7 +92,7 @@ app.post('/api/submit', upload.array('statements', 5), (req, res) => {
       id: Date.now(),
       receivedAt: new Date().toISOString(),
       company: body.company || '',
-      contactName: body.name || '',
+      contactName: body.name || body.contactName || '',
       phone: body.phone || '',
       email: body.email || '',
       amount: body.amount || '',
@@ -94,7 +103,7 @@ app.post('/api/submit', upload.array('statements', 5), (req, res) => {
 
     saveLead(lead);
 
-    // Optional email notify (nodemailer) — only if SMTP config present
+    // Optional email notification if SMTP set up
     if (process.env.NOTIFY_EMAIL && process.env.SMTP_HOST) {
       try {
         const nodemailer = require('nodemailer');
@@ -109,9 +118,11 @@ app.post('/api/submit', upload.array('statements', 5), (req, res) => {
                 pass: process.env.SMTP_PASS
               } : undefined
             });
+
             const to = process.env.NOTIFY_EMAIL;
             const subject = `New funding request: ${lead.company || lead.contactName || 'Unknown'}`;
             const text = `New lead received:\n\nCompany: ${lead.company}\nContact: ${lead.contactName}\nEmail: ${lead.email}\nPhone: ${lead.phone}\nAmount: ${lead.amount}\n\nMessage:\n${lead.message}\n\nFiles:\n${files.map(f => f.originalname).join(', ')}`;
+
             await transporter.sendMail({
               from: process.env.SMTP_FROM || process.env.NOTIFY_EMAIL,
               to,
@@ -123,7 +134,7 @@ app.post('/api/submit', upload.array('statements', 5), (req, res) => {
           }
         })();
       } catch (e) {
-        console.error('nodemailer not installed or error', e);
+        console.error('nodemailer missing or error', e);
       }
     }
 
@@ -134,10 +145,10 @@ app.post('/api/submit', upload.array('statements', 5), (req, res) => {
   }
 });
 
-// Serve uploaded files publicly (NOTE: secure this in production)
+// Serve uploaded files publicly (be careful in production)
 app.use('/uploads', express.static(UPLOAD_DIR));
 
-// Admin: simple HTML page listing leads (protected)
+// --- Admin views (protected) ---
 app.get('/admin', requireAuth, (req, res) => {
   const leads = readLeads();
   let html = `<!doctype html><html><head><meta charset="utf-8"><title>Avalonic Admin</title>
@@ -152,15 +163,11 @@ app.get('/admin', requireAuth, (req, res) => {
   res.send(html);
 });
 
-// Optional: endpoint to get JSON of leads (protected)
 app.get('/api/leads', requireAuth, (req, res) => {
   const leads = readLeads();
   res.json({ ok: true, total: leads.length, leads });
 });
 
-// small helper used above
-function escapeHtml(s=''){ return (''+s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-
+// --- Start server ---
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, ()=>console.log(`Server running on port ${PORT}`));
-app.get('/health',(req,res)=>res.json({ok:true}));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
